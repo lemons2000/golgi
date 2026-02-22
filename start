@@ -1,3 +1,2 @@
-from mediapipe import*
+!pip install ultralytics mediapipe moviepy
 
-https://github.com/rhafaelc/Fall-Detection-YOLO-MediaPipe
