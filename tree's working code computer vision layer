@@ -1,0 +1,380 @@
+import cv2
+import mediapipe as mp
+from mediapipe.tasks import python as mp_python
+from mediapipe.tasks.python import vision as mp_vision
+from mediapipe.tasks.python.components import containers as mp_containers
+import numpy as np
+import time
+import json
+import urllib.request
+import os
+from dataclasses import dataclass, asdict
+from collections import deque
+from typing import Optional
+
+# Download the pose landmarker model if needed
+MODEL_PATH = os.path.join(os.path.dirname(__file__), "pose_landmarker.task")
+MODEL_URL = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task"
+
+def ensure_model():
+    if not os.path.exists(MODEL_PATH):
+        print("Downloading MediaPipe Pose Landmarker model (~7MB)...")
+        urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
+        print("Model downloaded.")
+
+# Drawing utilities (still available in 0.10)
+mp_drawing = mp.solutions.drawing_utils if hasattr(mp, 'solutions') else None
+
+
+# ─── Data Structures ─────────────────────────────────────────────────────────
+
+@dataclass
+class PoseFeatures:
+    """Raw features extracted from a single frame."""
+    timestamp: float
+    hip_y: float              # Normalized hip center Y position (0=top, 1=bottom)
+    head_y: float             # Normalized head Y position
+    spine_angle: float        # Angle of spine from vertical (degrees)
+    body_height: float        # Vertical span from head to feet (normalized)
+    hip_velocity: float       # Vertical velocity of hip (px/frame)
+    head_velocity: float      # Vertical velocity of head (px/frame)
+    visibility: float         # Average landmark visibility score
+
+
+@dataclass
+class RiskOutput:
+    """Output from the CV layer sent to the Risk Engine."""
+    timestamp: float
+    features: dict
+    flags: dict               # Boolean flags for detected events
+    risk_score: float         # 0.0 to 1.0 raw CV risk estimate
+    alert_type: str           # "none" | "fall" | "immobile" | "abnormal_posture"
+    description: str          # Human-readable summary
+
+
+# ─── Constants ───────────────────────────────────────────────────────────────
+
+FALL_VELOCITY_THRESHOLD = 0.015      # Normalized units/frame — rapid downward motion
+FALL_SPINE_ANGLE_THRESHOLD = 50      # Degrees from vertical = likely horizontal
+FALL_HEIGHT_DROP_THRESHOLD = 0.25    # Proportional body height drop in <0.5s
+IMMOBILITY_WINDOW_SECONDS = 5.0     # How long no movement = immobility alert
+IMMOBILITY_MOVEMENT_THRESHOLD = 0.005  # Below this = "no movement"
+HISTORY_BUFFER_FRAMES = 90          # ~3 seconds at 30fps
+
+
+# ─── Utility Functions ───────────────────────────────────────────────────────
+
+def angle_between(v1: np.ndarray, v2: np.ndarray) -> float:
+    """Angle in degrees between two 2D vectors."""
+    v1_u = v1 / (np.linalg.norm(v1) + 1e-6)
+    v2_u = v2 / (np.linalg.norm(v2) + 1e-6)
+    return float(np.degrees(np.arccos(np.clip(np.dot(v1_u, v2_u), -1.0, 1.0))))
+
+
+def landmark_to_array(lm) -> np.ndarray:
+    return np.array([lm.x, lm.y])
+
+
+# ─── Core Detector ───────────────────────────────────────────────────────────
+
+class FallDetector:
+    def __init__(self, fps: int = 30, output_callback=None):
+        """
+        Args:
+            fps: Expected frames per second (used for velocity scaling).
+            output_callback: Optional function called with RiskOutput on each frame.
+        """
+        self.fps = fps
+        self.output_callback = output_callback
+
+        # MediaPipe Tasks API (0.10+)
+        ensure_model()
+        base_options = mp_python.BaseOptions(model_asset_path=MODEL_PATH)
+        options = mp_vision.PoseLandmarkerOptions(
+            base_options=base_options,
+            running_mode=mp_vision.RunningMode.IMAGE,
+            num_poses=1,
+            min_pose_detection_confidence=0.5,
+            min_pose_presence_confidence=0.5,
+            min_tracking_confidence=0.5,
+        )
+        self.pose = mp_vision.PoseLandmarker.create_from_options(options)
+
+        # History buffers
+        self.feature_history: deque = deque(maxlen=HISTORY_BUFFER_FRAMES)
+        self.last_movement_time: float = time.time()
+        self.last_features: Optional[PoseFeatures] = None
+
+        # State
+        self.frame_count = 0
+        self.alert_cooldown = 0   # Frames before next alert can fire
+
+    def extract_features(self, landmarks, frame_shape) -> Optional[PoseFeatures]:
+        """Extract pose features from MediaPipe Tasks landmarks (list of NormalizedLandmark)."""
+        H, W = frame_shape[:2]
+
+        # Key landmark indices (MediaPipe Pose — same indices in Tasks API)
+        NOSE = 0
+        LEFT_SHOULDER = 11; RIGHT_SHOULDER = 12
+        LEFT_HIP = 23;       RIGHT_HIP = 24
+        LEFT_ANKLE = 27;     RIGHT_ANKLE = 28
+
+        def get(idx):
+            return landmarks[idx]
+
+        # Check visibility
+        key_lms = [NOSE, LEFT_SHOULDER, RIGHT_SHOULDER, LEFT_HIP, RIGHT_HIP]
+        visibility = np.mean([landmarks[i].visibility for i in key_lms])
+        if visibility < 0.4:
+            return None  # Person not visible enough
+
+        # Derived positions (normalized 0-1)
+        head_y = get(NOSE).y
+        hip_y = (get(LEFT_HIP).y + get(RIGHT_HIP).y) / 2
+        shoulder_y = (get(LEFT_SHOULDER).y + get(RIGHT_SHOULDER).y) / 2
+        ankle_y = (get(LEFT_ANKLE).y + get(RIGHT_ANKLE).y) / 2
+
+        # Body height (head to ankle vertical span)
+        body_height = ankle_y - head_y  # positive = upright
+
+        # Spine angle: vector from hip center to shoulder center vs vertical
+        hip_center = np.array([(get(LEFT_HIP).x + get(RIGHT_HIP).x) / 2, hip_y])
+        shoulder_center = np.array([(get(LEFT_SHOULDER).x + get(RIGHT_SHOULDER).x) / 2, shoulder_y])
+        spine_vec = shoulder_center - hip_center
+        vertical = np.array([0, -1])  # upward in screen coords
+        spine_angle = angle_between(spine_vec, vertical)
+
+        # Velocities
+        hip_velocity = 0.0
+        head_velocity = 0.0
+        if self.last_features is not None:
+            dt = max(1 / self.fps, 1e-3)
+            hip_velocity = (hip_y - self.last_features.hip_y) / dt
+            head_velocity = (head_y - self.last_features.head_y) / dt
+
+        return PoseFeatures(
+            timestamp=time.time(),
+            hip_y=hip_y,
+            head_y=head_y,
+            spine_angle=spine_angle,
+            body_height=body_height,
+            hip_velocity=hip_velocity,
+            head_velocity=head_velocity,
+            visibility=visibility
+        )
+
+    def detect_events(self, features: PoseFeatures) -> dict:
+        """Detect specific events from current + historical features."""
+        flags = {
+            "sudden_collapse": False,
+            "prolonged_immobility": False,
+            "abnormal_posture": False,
+            "rapid_descent": False,
+        }
+
+        # ── 1. Sudden collapse: rapid downward velocity + body going horizontal
+        if (features.hip_velocity > FALL_VELOCITY_THRESHOLD and
+                features.spine_angle > FALL_SPINE_ANGLE_THRESHOLD):
+            flags["sudden_collapse"] = True
+
+        # ── 2. Rapid descent without posture change (sliding, fainting)
+        if features.hip_velocity > FALL_VELOCITY_THRESHOLD * 1.5 and features.spine_angle > 30:
+            flags["rapid_descent"] = True
+
+        # ── 3. Abnormal posture: spine angle consistently high
+        if len(self.feature_history) > 10:
+            recent = list(self.feature_history)[-10:]
+            avg_spine = np.mean([f.spine_angle for f in recent])
+            if avg_spine > 40 and features.body_height < 0.3:
+                flags["abnormal_posture"] = True
+
+        # ── 4. Prolonged immobility: hip hasn't moved for N seconds
+        if self.last_features is not None:
+            movement = abs(features.hip_y - self.last_features.hip_y) + \
+                       abs(features.head_y - self.last_features.head_y)
+            if movement > IMMOBILITY_MOVEMENT_THRESHOLD:
+                self.last_movement_time = features.timestamp
+        
+        immobility_duration = features.timestamp - self.last_movement_time
+        if immobility_duration > IMMOBILITY_WINDOW_SECONDS:
+            flags["prolonged_immobility"] = True
+
+        return flags, immobility_duration
+
+    def compute_risk_score(self, flags: dict, features: PoseFeatures) -> float:
+        """Heuristic risk score 0.0–1.0 from CV layer (before Risk Engine ML)."""
+        score = 0.0
+        if flags["sudden_collapse"]:   score += 0.6
+        if flags["rapid_descent"]:     score += 0.3
+        if flags["abnormal_posture"]:  score += 0.25
+        if flags["prolonged_immobility"]: score += 0.4
+        # Boost for combined signals
+        if flags["sudden_collapse"] and flags["prolonged_immobility"]:
+            score += 0.2
+        return min(score, 1.0)
+
+    def build_description(self, flags: dict, features: PoseFeatures,
+                          immobility_duration: float) -> tuple[str, str]:
+        """Build human-readable description and alert type."""
+        if flags["sudden_collapse"]:
+            return "sudden_collapse", (
+                f"Sudden collapse detected — spine angle {features.spine_angle:.1f}°, "
+                f"rapid downward velocity {features.hip_velocity:.3f}/s"
+            )
+        if flags["prolonged_immobility"]:
+            return "immobile", (
+                f"No movement for {immobility_duration:.1f}s — "
+                f"possible unresponsiveness"
+            )
+        if flags["abnormal_posture"]:
+            return "abnormal_posture", (
+                f"Abnormal posture detected — sustained spine angle "
+                f"{features.spine_angle:.1f}°, body height {features.body_height:.2f}"
+            )
+        if flags["rapid_descent"]:
+            return "fall", f"Rapid descent detected — velocity {features.hip_velocity:.3f}/s"
+        return "none", "Normal activity"
+
+    def process_frame(self, frame: np.ndarray) -> tuple[np.ndarray, Optional[RiskOutput]]:
+        """
+        Main entry point. Process one BGR frame.
+        Returns annotated frame + RiskOutput (or None if no person detected).
+        """
+        self.frame_count += 1
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+        results = self.pose.detect(mp_image)
+        risk_output = None
+
+        if results.pose_landmarks and len(results.pose_landmarks) > 0:
+            landmarks = results.pose_landmarks[0]  # First person
+            features = self.extract_features(landmarks, frame.shape)
+
+            if features is not None:
+                flags, immobility_dur = self.detect_events(features)
+                risk_score = self.compute_risk_score(flags, features)
+                alert_type, description = self.build_description(
+                    flags, features, immobility_dur
+                )
+
+                risk_output = RiskOutput(
+                    timestamp=features.timestamp,
+                    features=asdict(features),
+                    flags=flags,
+                    risk_score=risk_score,
+                    alert_type=alert_type,
+                    description=description
+                )
+
+                self.feature_history.append(features)
+                self.last_features = features
+
+                # Draw skeleton manually using world landmarks projected to frame
+                frame = self._draw_landmarks(frame, landmarks)
+
+                # Annotate frame
+                frame = self._annotate_frame(frame, risk_output, features)
+
+                if self.output_callback:
+                    self.output_callback(risk_output)
+
+        return frame, risk_output
+
+    def _draw_landmarks(self, frame: np.ndarray, landmarks) -> np.ndarray:
+        """Draw pose skeleton on frame."""
+        H, W = frame.shape[:2]
+        CONNECTIONS = [
+            (11, 12), (11, 13), (13, 15), (12, 14), (14, 16),
+            (11, 23), (12, 24), (23, 24), (23, 25), (24, 26),
+            (25, 27), (26, 28), (0, 11), (0, 12)
+        ]
+        pts = [(int(lm.x * W), int(lm.y * H)) for lm in landmarks]
+        for a, b in CONNECTIONS:
+            if a < len(pts) and b < len(pts):
+                cv2.line(frame, pts[a], pts[b], (0, 255, 128), 2)
+        for pt in pts:
+            cv2.circle(frame, pt, 4, (255, 255, 255), -1)
+        return frame
+
+    def _annotate_frame(self, frame: np.ndarray, output: RiskOutput,
+                        features: PoseFeatures) -> np.ndarray:
+        """Overlay HUD on frame."""
+        H, W = frame.shape[:2]
+
+        # Risk color
+        r = output.risk_score
+        if r < 0.3:   color = (0, 220, 80)    # green
+        elif r < 0.6: color = (0, 165, 255)   # orange
+        else:         color = (0, 40, 220)     # red
+
+        # Risk bar (top-left)
+        bar_w = int(W * 0.25)
+        bar_h = 12
+        filled = int(bar_w * r)
+        cv2.rectangle(frame, (10, 10), (10 + bar_w, 10 + bar_h), (50, 50, 50), -1)
+        cv2.rectangle(frame, (10, 10), (10 + filled, 10 + bar_h), color, -1)
+        cv2.putText(frame, f"RISK  {r:.0%}", (10, 38),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
+
+        # Alert banner
+        if output.alert_type != "none":
+            label = output.alert_type.upper().replace("_", " ")
+            cv2.rectangle(frame, (0, H - 50), (W, H), color, -1)
+            cv2.putText(frame, f"⚠  {label}", (12, H - 15),
+                        cv2.FONT_HERSHEY_DUPLEX, 0.8, (255, 255, 255), 2)
+
+        # Metrics panel (top-right)
+        metrics = [
+            f"Spine: {features.spine_angle:.1f}°",
+            f"Hip vel: {features.hip_velocity:.3f}",
+            f"Visibility: {features.visibility:.2f}",
+        ]
+        for i, m in enumerate(metrics):
+            cv2.putText(frame, m, (W - 200, 22 + i * 22),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.48, (200, 200, 200), 1)
+
+        return frame
+
+    def release(self):
+        self.pose.close()
+
+
+# ─── Main Loop ───────────────────────────────────────────────────────────────
+
+def run_webcam(output_log: str = "cv_output.jsonl"):
+    """Run fall detector on local webcam, log RiskOutput to JSONL."""
+
+    log_file = open(output_log, "a")
+
+    def on_output(risk_output: RiskOutput):
+        if risk_output.alert_type != "none":
+            log_file.write(json.dumps(asdict(risk_output)) + "\n")
+            log_file.flush()
+
+    detector = FallDetector(fps=30, output_callback=on_output)
+    cap = cv2.VideoCapture(0)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+
+    print("CV Layer running. Press Q to quit.")
+
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        frame, output = detector.process_frame(frame)
+        cv2.imshow("Agentic AI — CV Layer", frame)
+
+        if cv2.waitKey(1) & 0xFF == ord("q"):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+    detector.release()
+    log_file.close()
+    print(f"Session log saved to {output_log}")
+
+
+if __name__ == "__main__":
+    run_webcam()
